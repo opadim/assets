@@ -105,13 +105,27 @@
 
   var outputParams = {};
 
+  // "gclid" as a map source falls back to the other Google Ads click IDs:
+  // iOS app/web traffic arrives with gbraid or wbraid instead of gclid.
+  var GCLID_FALLBACKS = ["gclid", "gbraid", "wbraid"];
+
+  function sourceValue(src) {
+    if (src === "gclid") {
+      for (var i = 0; i < GCLID_FALLBACKS.length; i++) {
+        if (capturedParams[GCLID_FALLBACKS[i]]) return capturedParams[GCLID_FALLBACKS[i]];
+      }
+      return "";
+    }
+    return capturedParams[src] || "";
+  }
+
   Object.keys(cfg.map).forEach(function (destParam) {
     var sources = cfg.map[destParam];
     if (!sources || !sources.length) return;
 
     if (sources.length === 1) {
       // Single source — include only if present
-      var val = capturedParams[sources[0]] || "";
+      var val = sourceValue(sources[0]);
       if (val) {
         outputParams[destParam] = val;
       }
@@ -119,7 +133,7 @@
       // Multiple sources — positional concatenation
       var hasAny = false;
       var parts = sources.map(function (src) {
-        var v = capturedParams[src] || "";
+        var v = sourceValue(src);
         if (v) hasAny = true;
         return v;
       });
@@ -184,15 +198,19 @@
     var links = document.getElementsByTagName("a");
     for (var i = 0; i < links.length; i++) {
       var a = links[i];
+      // a.href is always absolute ("#top" → "https://site/page#top"), so
+      // same-page anchors must be detected on the attribute as written.
+      // Rewriting them would change the query string and turn an in-page
+      // jump into a full page reload.
+      var raw  = (a.getAttribute("href") || "").trim();
       var href = a.href;
 
       // Skip non-navigating links
-      if (!href ||
+      if (!raw || !href ||
+          raw.charAt(0) === "#" ||
           href.startsWith("mailto:") ||
           href.startsWith("tel:") ||
-          href.startsWith("javascript:") ||
-          href === "#" ||
-          (href.indexOf("#") >= 0 && href.split("#")[0] === "")) {
+          href.startsWith("javascript:")) {
         continue;
       }
 
@@ -239,39 +257,118 @@
 
   // ── Process forms ────────────────────────────────────────────
 
+  function fillForm(form) {
+    // ownerDocument, not document: the form may live inside an iframe
+    var doc = form.ownerDocument;
+
+    // Inject/overwrite mapped params as hidden inputs
+    Object.keys(outputParams).forEach(function (key) {
+      var existing = form.querySelector('input[name="' + key + '"]');
+      if (existing) {
+        existing.value = outputParams[key];
+      } else {
+        var input = doc.createElement("input");
+        input.type  = "hidden";
+        input.name  = key;
+        input.value = outputParams[key];
+        form.appendChild(input);
+      }
+    });
+
+    // Also add captured params not in map
+    Object.keys(capturedParams).forEach(function (key) {
+      if (outputParams.hasOwnProperty(key)) return;
+      var existing = form.querySelector('input[name="' + key + '"]');
+      if (!existing) {
+        var input = doc.createElement("input");
+        input.type  = "hidden";
+        input.name  = key;
+        input.value = capturedParams[key];
+        form.appendChild(input);
+      }
+    });
+  }
+
   function processForms() {
     var forms = document.getElementsByTagName("form");
     for (var i = 0; i < forms.length; i++) {
-      var form = forms[i];
-
-      // Inject/overwrite mapped params as hidden inputs
-      Object.keys(outputParams).forEach(function (key) {
-        var existing = form.querySelector('input[name="' + key + '"]');
-        if (existing) {
-          existing.value = outputParams[key];
-        } else {
-          var input = document.createElement("input");
-          input.type  = "hidden";
-          input.name  = key;
-          input.value = outputParams[key];
-          form.appendChild(input);
-        }
-      });
-
-      // Also add captured params not in map
-      Object.keys(capturedParams).forEach(function (key) {
-        if (outputParams.hasOwnProperty(key)) return;
-        var existing = form.querySelector('input[name="' + key + '"]');
-        if (!existing) {
-          var input = document.createElement("input");
-          input.type  = "hidden";
-          input.name  = key;
-          input.value = capturedParams[key];
-          form.appendChild(input);
-        }
-      });
+      fillForm(forms[i]);
     }
     log("Forms processed:", forms.length);
+  }
+
+  // ── Process iframes ──────────────────────────────────────────
+  //
+  // Forms embedded via <iframe> live in another document, so processForms
+  // never sees them.
+  //   Same-origin iframe  → fill its forms directly, and again at submit time
+  //                         (capture phase, before the form's own handler
+  //                         builds its FormData).
+  //   Cross-origin iframe → the DOM is off-limits; append the mapped params to
+  //                         its src instead. Opt-in only (data-cnl attribute or
+  //                         cnl.frames host list), so third-party embeds
+  //                         (YouTube, maps, chat widgets) are left alone.
+
+  function isFrameOptedIn(fr, url) {
+    if (fr.hasAttribute("data-cnl")) return true;
+    var hosts = cfg.frames || [];
+    for (var i = 0; i < hosts.length; i++) {
+      if (url.hostname === hosts[i] || url.hostname.slice(-(hosts[i].length + 1)) === "." + hosts[i]) return true;
+    }
+    return false;
+  }
+
+  function processFrame(fr) {
+    if (fr.hasAttribute("data-cnl-off")) return;
+
+    var doc = null;
+    try { doc = fr.contentDocument; } catch (e) { }
+
+    if (doc) {
+      // Initial about:blank before the real document arrives — the load
+      // listener will call us again
+      if (doc.location.href === "about:blank") return;
+
+      var forms = doc.getElementsByTagName("form");
+      for (var i = 0; i < forms.length; i++) fillForm(forms[i]);
+
+      if (!doc.__cnl) {
+        doc.__cnl = true;
+        doc.addEventListener("submit", function (e) {
+          if (e.target && e.target.tagName === "FORM") fillForm(e.target);
+        }, true);
+      }
+      log("Same-origin iframe processed:", doc.location.href, forms.length, "form(s)");
+      return;
+    }
+
+    // Cross-origin
+    var src = fr.getAttribute("src");
+    if (!src) return;
+    try {
+      var url = new URL(src, document.location.href);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return;
+      if (!isFrameOptedIn(fr, url)) return;
+      var next = buildUrl(url.toString());
+      if (next !== fr.src) {          // compare resolved URLs so retries don't reload it
+        fr.src = next;
+        log("Cross-origin iframe src rewritten:", next);
+      }
+    } catch (e) { }
+  }
+
+  function processFrames() {
+    var frames = document.getElementsByTagName("iframe");
+    for (var i = 0; i < frames.length; i++) {
+      var fr = frames[i];
+      if (!fr.__cnl) {
+        fr.__cnl = true;
+        // Fires on every (re)load of the iframe's document
+        fr.addEventListener("load", function () { processFrame(this); });
+      }
+      processFrame(fr);
+    }
+    log("Iframes processed:", frames.length);
   }
 
   // ── Run all ────────────────────────────────────────
@@ -280,6 +377,7 @@
     processLinks();
     processButtons();
     processForms();
+    processFrames();
   }
 
   // ── MutationObserver ─────────────────────────────────────────
@@ -295,10 +393,12 @@
           return el.tagName === "A" ||
                  el.tagName === "BUTTON" ||
                  el.tagName === "FORM" ||
+                 el.tagName === "IFRAME" ||
                  el.querySelector && (
                    el.querySelector("a") ||
                    el.querySelector("button") ||
-                   el.querySelector("form")
+                   el.querySelector("form") ||
+                   el.querySelector("iframe")
                  );
         });
       });
@@ -330,6 +430,13 @@
   if (document.readyState === "complete") {
     boot();
   } else {
+    // Iframes can't wait for window.load: by then they've finished loading,
+    // and a cross-origin src rewrite would reload the form the visitor sees
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", processFrames);
+    } else {
+      processFrames();
+    }
     window.addEventListener("load", boot);
   }
 
